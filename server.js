@@ -183,24 +183,90 @@ app.get('*', async (req, res) => {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    // Убираем признаки автоматизации
+    // Убираем все признаки автоматизации
     await page.evaluateOnNewDocument(() => {
+      // Скрываем webdriver
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      window.chrome = { runtime: {} };
+      
+      // Добавляем плагины
+      Object.defineProperty(navigator, 'plugins', { 
+        get: () => [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin' }
+        ] 
+      });
+      
+      // Языки
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'ru'] });
+      
+      // Chrome объект
+      window.chrome = { 
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+      };
+      
+      // Permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+      
+      // WebGL vendor
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) return 'Intel Inc.';
+        if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+        return getParameter.apply(this, [parameter]);
+      };
     });
     
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 90000 });
+    // Включаем JavaScript и все фичи
+    await page.setJavaScriptEnabled(true);
     
-    // Ждём прохождения Cloudflare (до 30 сек)
-    await page.waitForFunction(() => {
-      return !document.title.includes('Just a moment') && 
-             !document.body.innerHTML.includes('Checking your browser');
-    }, { timeout: 30000 }).catch(() => {});
+    // Разрешаем все разрешения
+    const context = br.defaultBrowserContext();
+    await context.overridePermissions(url, ['geolocation', 'notifications']);
     
-    // Дополнительная задержка для полной загрузки
-    await page.waitForTimeout(2000);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
+    
+    // Ждём загрузки Cloudflare challenge
+    let attempts = 0;
+    const maxAttempts = 60; // 60 секунд
+    
+    while (attempts < maxAttempts) {
+      const pageContent = await page.content();
+      const title = await page.title();
+      
+      // Проверяем прошли ли Cloudflare
+      if (!title.includes('Just a moment') && 
+          !title.includes('Verify you are human') &&
+          !pageContent.includes('Checking your browser') &&
+          !pageContent.includes('cf-challenge-running')) {
+        console.log('Cloudflare passed!');
+        break;
+      }
+      
+      // Ждём и пробуем кликнуть по чекбоксу если он есть
+      try {
+        const checkbox = await page.$('input[type="checkbox"]');
+        if (checkbox) {
+          console.log('Found checkbox, clicking...');
+          await checkbox.click();
+          await page.waitForTimeout(2000);
+        }
+      } catch (e) {}
+      
+      await page.waitForTimeout(1000);
+      attempts++;
+    }
+    
+    // Дополнительная задержка
+    await page.waitForTimeout(3000);
     
     let html = await page.content();
     
@@ -246,38 +312,72 @@ bot.onText(/\/test/, async (msg) => {
     const br = await getBrowser();
     page = await br.newPage();
     
-    // Увеличиваем таймауты
     page.setDefaultTimeout(90000);
     page.setDefaultNavigationTimeout(90000);
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    // Убираем признаки автоматизации
+    // Убираем все признаки автоматизации
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      window.chrome = { runtime: {} };
+      Object.defineProperty(navigator, 'plugins', { 
+        get: () => [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' }
+        ] 
+      });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'ru'] });
+      window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
     });
     
+    await page.setJavaScriptEnabled(true);
+    const context = br.defaultBrowserContext();
+    await context.overridePermissions(TARGET_SITE, ['geolocation', 'notifications']);
+    
     const start = Date.now();
-    await page.goto(TARGET_SITE, { waitUntil: 'networkidle0', timeout: 90000 });
+    await page.goto(TARGET_SITE, { waitUntil: 'networkidle2', timeout: 90000 });
+    
+    bot.sendMessage(msg.chat.id, '⏳ Жду прохождения Cloudflare...');
     
     // Ждём Cloudflare
-    await page.waitForFunction(() => {
-      return !document.title.includes('Just a moment') && 
-             !document.body.innerHTML.includes('Checking your browser');
-    }, { timeout: 30000 }).catch(() => {});
+    let attempts = 0;
+    while (attempts < 60) {
+      const title = await page.title();
+      const content = await page.content();
+      
+      if (!title.includes('Just a moment') && 
+          !title.includes('Verify you are human') &&
+          !content.includes('Checking your browser')) {
+        break;
+      }
+      
+      // Пробуем кликнуть чекбокс
+      try {
+        const checkbox = await page.$('input[type="checkbox"]');
+        if (checkbox) await checkbox.click();
+      } catch (e) {}
+      
+      await page.waitForTimeout(1000);
+      attempts++;
+    }
     
-    // Дополнительная задержка
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
     
     const time = Date.now() - start;
     const title = await page.title();
+    const finalContent = await page.content();
+    
+    const passed = !title.includes('Just a moment') && 
+                   !title.includes('Verify you are human') &&
+                   !finalContent.includes('cf-challenge-running');
     
     bot.sendMessage(msg.chat.id, 
-      `✅ Успешно!\n⏱️ Время: ${time}ms\n📄 Заголовок: ${title}\n🔒 Прокси: ${PROXY_URL ? 'да' : 'нет'}`
+      `${passed ? '✅' : '⚠️'} ${passed ? 'Успешно!' : 'Частично'}\n` +
+      `⏱️ Время: ${time}ms\n` +
+      `📄 Заголовок: ${title}\n` +
+      `🔒 Прокси: ${currentProxy ? 'да' : 'нет'}\n` +
+      `${!passed ? '\n⚠️ Cloudflare не пройден полностью' : ''}`
     );
   } catch (err) {
     bot.sendMessage(msg.chat.id, `❌ Ошибка: ${err.message}`);
