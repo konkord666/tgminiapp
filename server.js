@@ -233,51 +233,29 @@ app.get('*', async (req, res) => {
     // Быстрая загрузка
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
-    // Ждём загрузки Cloudflare скриптов
-    await page.waitForTimeout(3000);
+    // Минимальная задержка
+    await page.waitForTimeout(1500);
     
     let html = await page.content();
+    
+    // Добавляем base tag для всех страниц
+    const baseUrl = new URL(TARGET_SITE);
+    if (html.includes('<head>')) {
+      html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
+    }
     
     // Проверяем Cloudflare
     const isCloudflare = html.includes('cf-challenge') || 
                          html.includes('Just a moment') || 
-                         html.includes('Verify you are human') ||
-                         html.includes('_cf_chl_opt');
+                         html.includes('Verify you are human');
     
-    if (isCloudflare) {
-      console.log('Cloudflare detected, fixing paths...');
-      
-      // Исправляем пути для Cloudflare ресурсов
-      const baseUrl = new URL(TARGET_SITE);
-      
-      // Заменяем относительные пути на абсолютные
-      html = html.replace(/src="\/cdn-cgi\//g, `src="${baseUrl.origin}/cdn-cgi/`);
-      html = html.replace(/href="\/cdn-cgi\//g, `href="${baseUrl.origin}/cdn-cgi/`);
-      html = html.replace(/action="\/\?__cf/g, `action="${baseUrl.origin}/?__cf`);
-      html = html.replace(/"\/cdn-cgi\//g, `"${baseUrl.origin}/cdn-cgi/`);
-      html = html.replace(/'\/cdn-cgi\//g, `'${baseUrl.origin}/cdn-cgi/`);
-      
-      // Добавляем base tag для правильной загрузки ресурсов
-      if (html.includes('<head>')) {
-        html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
-      }
-      
-      // Убираем CSP заголовки которые могут блокировать
-      html = html.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
-      
-    } else {
-      // Обычная страница - внедряем трекер
+    // Внедряем трекер только если НЕ Cloudflare
+    if (!isCloudflare) {
       if (html.includes('</body>')) {
         html = html.replace('</body>', trackerScript + '</body>');
       } else {
         html += trackerScript;
       }
-      
-      // Исправляем пути для обычных ресурсов
-      const baseUrl = new URL(TARGET_SITE);
-      html = html.replace(/src="\/([^"]+)"/g, `src="${baseUrl.origin}/$1"`);
-      html = html.replace(/href="\/([^"]+)"/g, `href="${baseUrl.origin}/$1"`);
-      html = html.replace(/url\(\/([^)]+)\)/g, `url(${baseUrl.origin}/$1)`);
     }
     
     // Важные заголовки для работы Cloudflare
