@@ -299,6 +299,70 @@ bot.onText(/\/clear/, async (msg) => {
   bot.sendMessage(msg.chat.id, '🗑️ Очищено');
 });
 
+bot.onText(/\/proxy/, async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_ID) return;
+  
+  if (!PROXY_URL) {
+    return bot.sendMessage(msg.chat.id, '❌ PROXY_URL не настроен');
+  }
+  
+  bot.sendMessage(msg.chat.id, `🔍 Проверяю прокси...\n📡 ${PROXY_URL.replace(/:[^:@]+@/, ':***@')}`);
+  
+  // Тестируем разные форматы
+  const formats = [
+    `http://${PROXY_URL}`,
+    `socks5://${PROXY_URL}`,
+    PROXY_URL
+  ];
+  
+  for (let i = 0; i < formats.length; i++) {
+    const testProxy = formats[i];
+    let testBrowser = null;
+    let testPage = null;
+    
+    try {
+      bot.sendMessage(msg.chat.id, `Тест ${i+1}/3: ${testProxy.includes('://') ? testProxy.split('://')[0] : 'без протокола'}...`);
+      
+      const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        `--proxy-server=${testProxy}`
+      ];
+      
+      testBrowser = await puppeteer.launch({
+        headless: 'new',
+        args,
+        protocolTimeout: 30000,
+        timeout: 30000
+      });
+      
+      testPage = await testBrowser.newPage();
+      testPage.setDefaultTimeout(30000);
+      
+      await testPage.goto('https://api.ipify.org?format=json', { timeout: 30000 });
+      const content = await testPage.content();
+      const ipMatch = content.match(/"ip":"([^"]+)"/);
+      const proxyIP = ipMatch ? ipMatch[1] : 'неизвестно';
+      
+      await testBrowser.close();
+      
+      return bot.sendMessage(msg.chat.id, 
+        `✅ Прокси работает!\n` +
+        `📡 Формат: ${testProxy.includes('://') ? testProxy.split('://')[0] : 'без протокола'}\n` +
+        `🌐 IP через прокси: ${proxyIP}\n\n` +
+        `Используй этот формат:\nPROXY_URL=${testProxy}`
+      );
+      
+    } catch (err) {
+      if (testBrowser) await testBrowser.close().catch(() => {});
+      bot.sendMessage(msg.chat.id, `❌ Формат ${i+1} не работает: ${err.message.substring(0, 100)}`);
+    }
+  }
+  
+  bot.sendMessage(msg.chat.id, '❌ Ни один формат не сработал. Проверь данные прокси.');
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server on port ' + PORT));
 
