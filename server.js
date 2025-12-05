@@ -30,15 +30,39 @@ async function getBrowser() {
       '--disable-web-security'
     ];
     
-    if (PROXY_URL) {
+    // Only add proxy if explicitly set and valid
+    if (PROXY_URL && PROXY_URL.trim()) {
+      console.log('Using proxy:', PROXY_URL);
       args.push(`--proxy-server=${PROXY_URL}`);
+    } else {
+      console.log('No proxy configured');
     }
     
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args
-    });
+    try {
+      browser = await puppeteer.launch({
+        headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args,
+        protocolTimeout: 60000, // 60 секунд
+        timeout: 60000
+      });
+    } catch (err) {
+      console.error('Failed to launch browser with current config:', err.message);
+      // Retry without proxy if it failed
+      if (PROXY_URL) {
+        console.log('Retrying without proxy...');
+        const argsNoProxy = args.filter(arg => !arg.startsWith('--proxy-server='));
+        browser = await puppeteer.launch({
+          headless: 'new',
+          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+          args: argsNoProxy,
+          protocolTimeout: 60000,
+          timeout: 60000
+        });
+      } else {
+        throw err;
+      }
+    }
   }
   return browser;
 }
@@ -143,13 +167,17 @@ app.get('*', async (req, res) => {
     const br = await getBrowser();
     page = await br.newPage();
     
+    // Увеличиваем таймауты
+    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(60000);
+    
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     
-    // Ждём прохождения Cloudflare (до 10 сек)
-    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 10000 }).catch(() => {});
+    // Ждём прохождения Cloudflare (до 15 сек)
+    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 15000 }).catch(() => {});
     
     let html = await page.content();
     
@@ -194,17 +222,24 @@ bot.onText(/\/test/, async (msg) => {
   try {
     const br = await getBrowser();
     page = await br.newPage();
+    
+    // Увеличиваем таймауты
+    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(60000);
+    
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
     
     const start = Date.now();
-    await page.goto(TARGET_SITE, { waitUntil: 'networkidle2', timeout: 30000 });
-    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 10000 }).catch(() => {});
-    const time = Date.now() - start;
+    await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
     
+    // Ждём Cloudflare
+    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 15000 }).catch(() => {});
+    
+    const time = Date.now() - start;
     const title = await page.title();
     
     bot.sendMessage(msg.chat.id, 
-      `✅ Успешно!\n⏱ Время: ${time}ms\n📄 Заголовок: ${title}\n🔒 Прокси: ${PROXY_URL ? 'да' : 'нет'}`
+      `✅ Успешно!\n⏱️ Время: ${time}ms\n📄 Заголовок: ${title}\n🔒 Прокси: ${PROXY_URL ? 'да' : 'нет'}`
     );
   } catch (err) {
     bot.sendMessage(msg.chat.id, `❌ Ошибка: ${err.message}`);
