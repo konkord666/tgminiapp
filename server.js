@@ -34,10 +34,12 @@ async function getBrowser() {
       '--disable-features=IsolateOrigins,site-per-process'
     ];
     
-    // Only add proxy if explicitly set and valid
-    if (PROXY_URL && PROXY_URL.trim()) {
-      console.log('Using proxy:', PROXY_URL);
-      args.push(`--proxy-server=${PROXY_URL}`);
+    // Используем currentProxy (может быть изменён через бота)
+    const proxyToUse = currentProxy || PROXY_URL;
+    
+    if (proxyToUse && proxyToUse.trim()) {
+      console.log('Using proxy:', proxyToUse.replace(/:[^:@]+@/, ':***@'));
+      args.push(`--proxy-server=${proxyToUse}`);
     } else {
       console.log('No proxy configured');
     }
@@ -299,68 +301,203 @@ bot.onText(/\/clear/, async (msg) => {
   bot.sendMessage(msg.chat.id, '🗑️ Очищено');
 });
 
-bot.onText(/\/proxy/, async (msg) => {
+// Временное хранилище прокси (в памяти)
+let currentProxy = PROXY_URL;
+
+bot.onText(/\/setproxy (.+)/, async (msg, match) => {
   if (msg.chat.id.toString() !== ADMIN_ID) return;
   
-  if (!PROXY_URL) {
-    return bot.sendMessage(msg.chat.id, '❌ PROXY_URL не настроен');
+  const proxyInput = match[1].trim();
+  
+  bot.sendMessage(msg.chat.id, `🔍 Тестирую прокси: ${proxyInput.replace(/:[^:@]+@/, ':***@')}`);
+  
+  // Парсим формат IP:PORT:USER:PASS
+  let testProxies = [];
+  
+  if (proxyInput.includes('@')) {
+    // Уже в формате user:pass@ip:port
+    testProxies = [
+      `http://${proxyInput}`,
+      `socks5://${proxyInput}`,
+      proxyInput
+    ];
+  } else {
+    // Формат IP:PORT:USER:PASS
+    const parts = proxyInput.split(':');
+    if (parts.length === 4) {
+      const [ip, port, user, pass] = parts;
+      testProxies = [
+        `http://${user}:${pass}@${ip}:${port}`,
+        `socks5://${user}:${pass}@${ip}:${port}`,
+        `${user}:${pass}@${ip}:${port}`
+      ];
+    } else if (parts.length === 2) {
+      // Формат IP:PORT без авторизации
+      testProxies = [
+        `http://${proxyInput}`,
+        `socks5://${proxyInput}`,
+        proxyInput
+      ];
+    } else {
+      return bot.sendMessage(msg.chat.id, 
+        '❌ Неверный формат!\n\n' +
+        'Используй один из форматов:\n' +
+        '• IP:PORT:USER:PASS\n' +
+        '• IP:PORT\n' +
+        '• http://user:pass@ip:port\n' +
+        '• user:pass@ip:port'
+      );
+    }
   }
   
-  bot.sendMessage(msg.chat.id, `🔍 Проверяю прокси...\n📡 ${PROXY_URL.replace(/:[^:@]+@/, ':***@')}`);
-  
-  // Тестируем разные форматы
-  const formats = [
-    `http://${PROXY_URL}`,
-    `socks5://${PROXY_URL}`,
-    PROXY_URL
-  ];
-  
-  for (let i = 0; i < formats.length; i++) {
-    const testProxy = formats[i];
+  // Тестируем форматы
+  for (let i = 0; i < testProxies.length; i++) {
+    const testProxy = testProxies[i];
     let testBrowser = null;
-    let testPage = null;
     
     try {
-      bot.sendMessage(msg.chat.id, `Тест ${i+1}/3: ${testProxy.includes('://') ? testProxy.split('://')[0] : 'без протокола'}...`);
+      const formatName = testProxy.includes('://') ? testProxy.split('://')[0] : 'без протокола';
+      bot.sendMessage(msg.chat.id, `⏳ Тест ${i+1}/${testProxies.length}: ${formatName}...`);
       
       const args = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-gpu',
         `--proxy-server=${testProxy}`
       ];
       
       testBrowser = await puppeteer.launch({
         headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args,
-        protocolTimeout: 30000,
-        timeout: 30000
+        protocolTimeout: 20000,
+        timeout: 20000
       });
       
-      testPage = await testBrowser.newPage();
-      testPage.setDefaultTimeout(30000);
+      const testPage = await testBrowser.newPage();
+      testPage.setDefaultTimeout(20000);
       
-      await testPage.goto('https://api.ipify.org?format=json', { timeout: 30000 });
+      await testPage.goto('https://api.ipify.org?format=json', { timeout: 20000 });
       const content = await testPage.content();
       const ipMatch = content.match(/"ip":"([^"]+)"/);
       const proxyIP = ipMatch ? ipMatch[1] : 'неизвестно';
       
       await testBrowser.close();
       
+      // Закрываем старый браузер и применяем новый прокси
+      if (browser) {
+        await browser.close().catch(() => {});
+        browser = null;
+      }
+      
+      currentProxy = testProxy;
+      
       return bot.sendMessage(msg.chat.id, 
-        `✅ Прокси работает!\n` +
-        `📡 Формат: ${testProxy.includes('://') ? testProxy.split('://')[0] : 'без протокола'}\n` +
-        `🌐 IP через прокси: ${proxyIP}\n\n` +
-        `Используй этот формат:\nPROXY_URL=${testProxy}`
+        `✅ Прокси работает и применён!\n\n` +
+        `📡 Формат: ${formatName}\n` +
+        `🌐 IP через прокси: ${proxyIP}\n` +
+        `🔗 Прокси: ${testProxy.replace(/:[^:@]+@/, ':***@')}\n\n` +
+        `⚠️ Прокси работает до перезапуска бота.\n` +
+        `Для постоянного использования добавь в Railway:\n` +
+        `PROXY_URL=${testProxy}`
       );
       
     } catch (err) {
       if (testBrowser) await testBrowser.close().catch(() => {});
-      bot.sendMessage(msg.chat.id, `❌ Формат ${i+1} не работает: ${err.message.substring(0, 100)}`);
+      await bot.sendMessage(msg.chat.id, `❌ Формат ${i+1} не работает`);
     }
   }
   
-  bot.sendMessage(msg.chat.id, '❌ Ни один формат не сработал. Проверь данные прокси.');
+  bot.sendMessage(msg.chat.id, 
+    '❌ Ни один формат не сработал.\n\n' +
+    'Возможные причины:\n' +
+    '• Неверные данные прокси\n' +
+    '• Прокси не работает\n' +
+    '• Прокси заблокирован\n' +
+    '• Неверный логин/пароль'
+  );
+});
+
+bot.onText(/\/proxy$/, async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_ID) return;
+  
+  const activeProxy = currentProxy || 'не настроен';
+  const maskedProxy = activeProxy !== 'не настроен' ? activeProxy.replace(/:[^:@]+@/, ':***@') : activeProxy;
+  
+  bot.sendMessage(msg.chat.id, 
+    `🔧 Управление прокси\n\n` +
+    `📡 Текущий прокси: ${maskedProxy}\n\n` +
+    `Команды:\n` +
+    `/setproxy IP:PORT:USER:PASS - установить прокси\n` +
+    `/setproxy http://user:pass@ip:port - установить прокси\n` +
+    `/noproxy - отключить прокси\n` +
+    `/testproxy - проверить текущий прокси`
+  );
+});
+
+bot.onText(/\/noproxy/, async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_ID) return;
+  
+  if (browser) {
+    await browser.close().catch(() => {});
+    browser = null;
+  }
+  
+  currentProxy = null;
+  bot.sendMessage(msg.chat.id, '✅ Прокси отключен');
+});
+
+bot.onText(/\/testproxy/, async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_ID) return;
+  
+  if (!currentProxy) {
+    return bot.sendMessage(msg.chat.id, '❌ Прокси не настроен. Используй /setproxy');
+  }
+  
+  bot.sendMessage(msg.chat.id, '⏳ Проверяю прокси...');
+  
+  let testBrowser = null;
+  try {
+    const args = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      `--proxy-server=${currentProxy}`
+    ];
+    
+    testBrowser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args,
+      protocolTimeout: 20000,
+      timeout: 20000
+    });
+    
+    const testPage = await testBrowser.newPage();
+    testPage.setDefaultTimeout(20000);
+    
+    const start = Date.now();
+    await testPage.goto('https://api.ipify.org?format=json', { timeout: 20000 });
+    const time = Date.now() - start;
+    
+    const content = await testPage.content();
+    const ipMatch = content.match(/"ip":"([^"]+)"/);
+    const proxyIP = ipMatch ? ipMatch[1] : 'неизвестно';
+    
+    await testBrowser.close();
+    
+    bot.sendMessage(msg.chat.id, 
+      `✅ Прокси работает!\n\n` +
+      `🌐 IP: ${proxyIP}\n` +
+      `⏱️ Время: ${time}ms\n` +
+      `🔗 Прокси: ${currentProxy.replace(/:[^:@]+@/, ':***@')}`
+    );
+    
+  } catch (err) {
+    if (testBrowser) await testBrowser.close().catch(() => {});
+    bot.sendMessage(msg.chat.id, `❌ Прокси не работает: ${err.message}`);
+  }
 });
 
 const PORT = process.env.PORT || 3000;
