@@ -175,109 +175,40 @@ app.get('*', async (req, res) => {
     const br = await getBrowser();
     page = await br.newPage();
     
-    // Увеличиваем таймауты
-    page.setDefaultTimeout(90000);
-    page.setDefaultNavigationTimeout(90000);
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
     
-    // Более реалистичный User-Agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    // Убираем все признаки автоматизации
-    await page.evaluateOnNewDocument(() => {
-      // Скрываем webdriver
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      
-      // Добавляем плагины
-      Object.defineProperty(navigator, 'plugins', { 
-        get: () => [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-          { name: 'Native Client', filename: 'internal-nacl-plugin' }
-        ] 
-      });
-      
-      // Языки
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'ru'] });
-      
-      // Chrome объект
-      window.chrome = { 
-        runtime: {},
-        loadTimes: function() {},
-        csi: function() {},
-        app: {}
-      };
-      
-      // Permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-      
-      // WebGL vendor
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) return 'Intel Inc.';
-        if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-        return getParameter.apply(this, [parameter]);
-      };
-    });
+    // Быстрая загрузка - просто получаем HTML
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
-    // Включаем JavaScript и все фичи
-    await page.setJavaScriptEnabled(true);
-    
-    // Разрешаем все разрешения
-    const context = br.defaultBrowserContext();
-    await context.overridePermissions(url, ['geolocation', 'notifications']);
-    
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
-    
-    // Ждём загрузки Cloudflare challenge
-    let attempts = 0;
-    const maxAttempts = 60; // 60 секунд
-    
-    while (attempts < maxAttempts) {
-      const pageContent = await page.content();
-      const title = await page.title();
-      
-      // Проверяем прошли ли Cloudflare
-      if (!title.includes('Just a moment') && 
-          !title.includes('Verify you are human') &&
-          !pageContent.includes('Checking your browser') &&
-          !pageContent.includes('cf-challenge-running')) {
-        console.log('Cloudflare passed!');
-        break;
-      }
-      
-      // Ждём и пробуем кликнуть по чекбоксу если он есть
-      try {
-        const checkbox = await page.$('input[type="checkbox"]');
-        if (checkbox) {
-          console.log('Found checkbox, clicking...');
-          await checkbox.click();
-          await page.waitForTimeout(2000);
-        }
-      } catch (e) {}
-      
-      await page.waitForTimeout(1000);
-      attempts++;
-    }
-    
-    // Дополнительная задержка
-    await page.waitForTimeout(3000);
+    // Ждём 2 секунды для загрузки основного контента
+    await page.waitForTimeout(2000);
     
     let html = await page.content();
     
-    // Внедряем трекер
-    if (html.includes('</body>')) {
-      html = html.replace('</body>', trackerScript + '</body>');
-    } else {
-      html += trackerScript;
+    // Внедряем трекер только если это не Cloudflare страница
+    const isCloudflare = html.includes('cf-challenge') || 
+                         html.includes('Just a moment') || 
+                         html.includes('Verify you are human');
+    
+    if (!isCloudflare) {
+      if (html.includes('</body>')) {
+        html = html.replace('</body>', trackerScript + '</body>');
+      } else {
+        html += trackerScript;
+      }
     }
     
-    res.setHeader('Content-Type', 'text/html');
+    // Исправляем относительные пути для ресурсов
+    const baseUrl = new URL(TARGET_SITE);
+    html = html.replace(/src="\/([^"]+)"/g, `src="${baseUrl.origin}/$1"`);
+    html = html.replace(/href="\/([^"]+)"/g, `href="${baseUrl.origin}/$1"`);
+    html = html.replace(/url\(\/([^)]+)\)/g, `url(${baseUrl.origin}/$1)`);
+    
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
   } catch (err) {
     console.error('Puppeteer error:', err.message);
@@ -312,72 +243,31 @@ bot.onText(/\/test/, async (msg) => {
     const br = await getBrowser();
     page = await br.newPage();
     
-    page.setDefaultTimeout(90000);
-    page.setDefaultNavigationTimeout(90000);
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    // Убираем все признаки автоматизации
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { 
-        get: () => [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' }
-        ] 
-      });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'ru'] });
-      window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
-    });
-    
-    await page.setJavaScriptEnabled(true);
-    const context = br.defaultBrowserContext();
-    await context.overridePermissions(TARGET_SITE, ['geolocation', 'notifications']);
-    
     const start = Date.now();
-    await page.goto(TARGET_SITE, { waitUntil: 'networkidle2', timeout: 90000 });
+    await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
-    bot.sendMessage(msg.chat.id, '⏳ Жду прохождения Cloudflare...');
-    
-    // Ждём Cloudflare
-    let attempts = 0;
-    while (attempts < 60) {
-      const title = await page.title();
-      const content = await page.content();
-      
-      if (!title.includes('Just a moment') && 
-          !title.includes('Verify you are human') &&
-          !content.includes('Checking your browser')) {
-        break;
-      }
-      
-      // Пробуем кликнуть чекбокс
-      try {
-        const checkbox = await page.$('input[type="checkbox"]');
-        if (checkbox) await checkbox.click();
-      } catch (e) {}
-      
-      await page.waitForTimeout(1000);
-      attempts++;
-    }
-    
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(2000);
     
     const time = Date.now() - start;
     const title = await page.title();
-    const finalContent = await page.content();
+    const content = await page.content();
     
-    const passed = !title.includes('Just a moment') && 
-                   !title.includes('Verify you are human') &&
-                   !finalContent.includes('cf-challenge-running');
+    const isCloudflare = title.includes('Just a moment') || 
+                         title.includes('Verify you are human') ||
+                         content.includes('cf-challenge');
     
     bot.sendMessage(msg.chat.id, 
-      `${passed ? '✅' : '⚠️'} ${passed ? 'Успешно!' : 'Частично'}\n` +
+      `✅ Загружено!\n` +
       `⏱️ Время: ${time}ms\n` +
       `📄 Заголовок: ${title}\n` +
       `🔒 Прокси: ${currentProxy ? 'да' : 'нет'}\n` +
-      `${!passed ? '\n⚠️ Cloudflare не пройден полностью' : ''}`
+      `${isCloudflare ? '🛡️ Cloudflare активен (капча будет видна пользователям)' : '✅ Без защиты'}`
     );
   } catch (err) {
     bot.sendMessage(msg.chat.id, `❌ Ошибка: ${err.message}`);
