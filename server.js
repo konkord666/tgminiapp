@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 app.use(express.json());
@@ -13,6 +14,10 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 const TARGET_SITE = process.env.TARGET_SITE || 'https://example.com';
+
+// Прокси (опционально)
+const PROXY_URL = process.env.PROXY_URL; // например: http://user:pass@proxy.com:8080
+const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
 
 // Инициализация БД
 async function initDB() {
@@ -108,12 +113,19 @@ app.post('/api/log', async (req, res) => {
 app.get('*', async (req, res) => {
   try {
     const url = TARGET_SITE + req.path;
-    const response = await fetch(url, {
+    const fetchOptions = {
       redirect: 'follow',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
-    });
+    };
+    
+    // Используем прокси если указан
+    if (proxyAgent) {
+      fetchOptions.agent = proxyAgent;
+    }
+    
+    const response = await fetch(url, fetchOptions);
     
     const contentType = response.headers.get('content-type') || '';
     
