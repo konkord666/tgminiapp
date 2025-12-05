@@ -18,7 +18,31 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 const TARGET_SITE = process.env.TARGET_SITE || 'https://example.com';
-const PROXY_URL = process.env.PROXY_URL;
+
+// Прокси настройки - можно менять прямо тут
+const PROXY_CONFIG = {
+  enabled: true, // true - включить, false - выключить
+  ip: '77.83.186.142',
+  port: '8000',
+  username: 'UnXGJU',
+  password: 'xLpbtW',
+  protocol: 'http' // 'http' или 'socks5'
+};
+
+// Формируем URL прокси
+function getProxyUrl() {
+  if (!PROXY_CONFIG.enabled) return null;
+  
+  const { protocol, username, password, ip, port } = PROXY_CONFIG;
+  
+  if (username && password) {
+    return `${protocol}://${username}:${password}@${ip}:${port}`;
+  } else {
+    return `${protocol}://${ip}:${port}`;
+  }
+}
+
+const PROXY_URL = process.env.PROXY_URL || getProxyUrl();
 
 // Браузер
 let browser = null;
