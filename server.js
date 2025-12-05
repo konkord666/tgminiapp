@@ -2,7 +2,11 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// Добавляем stealth плагин для обхода защиты
+puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
@@ -26,8 +30,8 @@ async function getBrowser() {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--single-process',
-      '--disable-web-security'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process'
     ];
     
     // Only add proxy if explicitly set and valid
@@ -43,8 +47,9 @@ async function getBrowser() {
         headless: 'new',
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args,
-        protocolTimeout: 60000, // 60 секунд
-        timeout: 60000
+        protocolTimeout: 90000,
+        timeout: 90000,
+        ignoreHTTPSErrors: true
       });
     } catch (err) {
       console.error('Failed to launch browser with current config:', err.message);
@@ -56,8 +61,9 @@ async function getBrowser() {
           headless: 'new',
           executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
           args: argsNoProxy,
-          protocolTimeout: 60000,
-          timeout: 60000
+          protocolTimeout: 90000,
+          timeout: 90000,
+          ignoreHTTPSErrors: true
         });
       } else {
         throw err;
@@ -168,16 +174,31 @@ app.get('*', async (req, res) => {
     page = await br.newPage();
     
     // Увеличиваем таймауты
-    page.setDefaultTimeout(60000);
-    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultTimeout(90000);
+    page.setDefaultNavigationTimeout(90000);
     
+    // Более реалистичный User-Agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Убираем признаки автоматизации
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };
+    });
     
-    // Ждём прохождения Cloudflare (до 15 сек)
-    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 15000 }).catch(() => {});
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 90000 });
+    
+    // Ждём прохождения Cloudflare (до 30 сек)
+    await page.waitForFunction(() => {
+      return !document.title.includes('Just a moment') && 
+             !document.body.innerHTML.includes('Checking your browser');
+    }, { timeout: 30000 }).catch(() => {});
+    
+    // Дополнительная задержка для полной загрузки
+    await page.waitForTimeout(2000);
     
     let html = await page.content();
     
@@ -224,16 +245,31 @@ bot.onText(/\/test/, async (msg) => {
     page = await br.newPage();
     
     // Увеличиваем таймауты
-    page.setDefaultTimeout(60000);
-    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultTimeout(90000);
+    page.setDefaultNavigationTimeout(90000);
     
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1920, height: 1080 });
+    
+    // Убираем признаки автоматизации
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };
+    });
     
     const start = Date.now();
-    await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(TARGET_SITE, { waitUntil: 'networkidle0', timeout: 90000 });
     
     // Ждём Cloudflare
-    await page.waitForFunction(() => !document.title.includes('Just a moment'), { timeout: 15000 }).catch(() => {});
+    await page.waitForFunction(() => {
+      return !document.title.includes('Just a moment') && 
+             !document.body.innerHTML.includes('Checking your browser');
+    }, { timeout: 30000 }).catch(() => {});
+    
+    // Дополнительная задержка
+    await page.waitForTimeout(2000);
     
     const time = Date.now() - start;
     const title = await page.title();
