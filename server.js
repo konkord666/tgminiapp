@@ -110,6 +110,7 @@ app.post('/api/log', async (req, res) => {
 app.use('/', createProxyMiddleware({
   target: TARGET_SITE,
   changeOrigin: true,
+  followRedirects: true,
   selfHandleResponse: true,
   on: {
     proxyRes: async (proxyRes, req, res) => {
