@@ -111,25 +111,31 @@ app.post('/api/log', async (req, res) => {
 
 // Прокси для всех запросов
 app.get('*', async (req, res) => {
+  const url = TARGET_SITE + req.path + (req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '');
+  console.log('Fetching:', url);
+  
   try {
-    const url = TARGET_SITE + req.path;
     const fetchOptions = {
       redirect: 'follow',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5'
       }
     };
     
-    // Используем прокси если указан
     if (proxyAgent) {
       fetchOptions.agent = proxyAgent;
     }
     
     const response = await fetch(url, fetchOptions);
+    console.log('Response:', response.status, response.headers.get('content-type'));
+    
+    if (!response.ok) {
+      return res.status(response.status).send(`Ошибка ${response.status}`);
+    }
     
     const contentType = response.headers.get('content-type') || '';
-    
-    // Передаём content-type
     res.setHeader('Content-Type', contentType);
     
     // HTML — внедряем трекер
@@ -145,15 +151,22 @@ app.get('*', async (req, res) => {
       }
       
       res.send(html);
-    } 
-    // Остальное — передаём как есть
-    else {
+    } else {
       const buffer = await response.arrayBuffer();
       res.send(Buffer.from(buffer));
     }
   } catch (err) {
-    console.error('Proxy error:', err.message);
-    res.status(500).send('Ошибка загрузки: ' + err.message);
+    console.error('Proxy error for', url, ':', err.message);
+    res.status(500).send(`
+      <html>
+        <body style="font-family: sans-serif; padding: 20px;">
+          <h2>❌ Ошибка загрузки</h2>
+          <p><b>URL:</b> ${url}</p>
+          <p><b>Ошибка:</b> ${err.message}</p>
+          <p><b>Прокси:</b> ${PROXY_URL ? 'включён' : 'выключен'}</p>
+        </body>
+      </html>
+    `);
   }
 });
 
@@ -165,6 +178,36 @@ bot.onText(/\/start/, (msg) => {
       inline_keyboard: [[{ text: '🚀 Открыть', web_app: { url: webappUrl } }]]
     }
   });
+});
+
+// Тест прокси
+bot.onText(/\/test/, async (msg) => {
+  if (msg.chat.id.toString() !== ADMIN_ID) return;
+  
+  let status = '🔧 Диагностика:\n\n';
+  status += `📍 TARGET_SITE: ${TARGET_SITE}\n`;
+  status += `🔒 PROXY: ${PROXY_URL ? 'включён' : 'выключен'}\n\n`;
+  
+  try {
+    const fetchOptions = {
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    };
+    if (proxyAgent) fetchOptions.agent = proxyAgent;
+    
+    const start = Date.now();
+    const response = await fetch(TARGET_SITE, fetchOptions);
+    const time = Date.now() - start;
+    
+    status += `✅ Сайт доступен\n`;
+    status += `⏱ Время: ${time}ms\n`;
+    status += `📊 Статус: ${response.status}\n`;
+    status += `📄 Тип: ${response.headers.get('content-type')?.slice(0, 50)}`;
+  } catch (err) {
+    status += `❌ Ошибка: ${err.message}`;
+  }
+  
+  bot.sendMessage(msg.chat.id, status);
 });
 
 bot.onText(/\/logs/, async (msg) => {
